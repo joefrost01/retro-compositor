@@ -6,7 +6,7 @@ use std::path::PathBuf;
 ///
 /// This is a simple wrapper around an RGB image buffer that provides
 /// convenient methods for pixel manipulation used by effects.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Frame {
     buffer: RgbImage,
 }

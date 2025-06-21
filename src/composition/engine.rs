@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     error::{CompositionError, Result},
     styles::Style,
-    video::{Frame, VideoClip, VideoSequence},
+    video::{VideoLoader, VideoProcessor, VideoCompositor, VideoSequence, VideoClip},
 };
 
 /// Main composition engine that orchestrates the entire retro video creation process
@@ -61,10 +61,14 @@ impl CompositionEngine {
         let timeline = self.generate_timeline(&audio_analysis, &video_sequence).await?;
 
         // Pipeline Step 4: Video Processing with Effects
-        self.process_video_with_effects(&video_sequence, &timeline).await?;
+        let processed_segments = self.process_video_with_effects(
+            &video_sequence,
+            &timeline,
+            &audio_analysis
+        ).await?;
 
         // Pipeline Step 5: Final Output Generation
-        self.generate_final_output(&timeline, output_path).await?;
+        self.generate_final_output(&processed_segments, audio_path, output_path).await?;
 
         info!("🎉 Composition complete! Output saved to: {:?}", output_path);
         Ok(())
@@ -129,51 +133,26 @@ impl CompositionEngine {
             }.into());
         }
 
-        let mut sequence = VideoSequence::new();
+        let mut video_loader = VideoLoader::new()
+            .map_err(|e| CompositionError::SequencingFailed {
+                reason: format!("Failed to initialize video loader: {}", e)
+            })?;
 
-        // Read directory entries and sort by filename
-        let mut entries: Vec<_> = std::fs::read_dir(video_dir)?
-            .collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+        let clips = video_loader.load_clips_from_directory(video_dir)
+            .map_err(|e| CompositionError::NoClipsFound {
+                path: format!("{}: {}", video_dir.display(), e)
+            })?;
 
-        entries.sort_by_key(|entry: &std::fs::DirEntry| entry.file_name());
-
-        let mut clips_found = 0;
-        let mut clips_loaded = 0;
-
-        for entry in entries {
-            let path = entry.path();
-
-            // Skip directories and hidden files
-            if path.is_dir() || self.is_hidden_file(&path) {
-                continue;
-            }
-
-            clips_found += 1;
-
-            // Try to parse as a numbered video clip
-            if let Some(clip) = VideoClip::from_path(&path) {
-                if clip.is_supported() {
-                    debug!("Found clip: {} (sequence {})", clip.name, clip.sequence_number);
-                    sequence.add_clip(clip);
-                    clips_loaded += 1;
-                } else {
-                    warn!("Unsupported format: {:?}", path);
-                }
-            } else {
-                warn!("Could not parse clip filename: {:?} (expected format: NN_name.ext)",
-                      path.file_name().unwrap_or_default());
-            }
-        }
-
-        if sequence.is_empty() {
+        if clips.is_empty() {
             return Err(CompositionError::NoClipsFound {
                 path: video_dir.display().to_string()
             }.into());
         }
 
+        let sequence: VideoSequence = clips.into_iter().collect();
+
         info!("   ✅ Video clips loaded:");
-        info!("      Files found: {}", clips_found);
-        info!("      Clips loaded: {}", clips_loaded);
+        info!("      Clips loaded: {}", sequence.len());
         info!("      Sequence length: {}", sequence.len());
 
         // Log the sequence order
@@ -184,14 +163,6 @@ impl CompositionEngine {
         }
 
         Ok(sequence)
-    }
-
-    /// Check if a file is hidden (starts with .)
-    fn is_hidden_file(&self, path: &Path) -> bool {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.starts_with('.'))
-            .unwrap_or(false)
     }
 
     // ==========================================
@@ -383,55 +354,37 @@ impl CompositionEngine {
         &self,
         video_sequence: &VideoSequence,
         timeline: &CompositionTimeline,
-    ) -> Result<()> {
+        audio_analysis: &AudioAnalysis,
+    ) -> Result<Vec<crate::video::ProcessedSegment>> {
         info!("🎨 Step 4: Processing video with {} style...", self.style.name());
 
-        // For now, demonstrate the concept with placeholder frames
-        // In a real implementation, this would load actual video frames
+        // Initialize video processor
+        let mut processor = VideoProcessor::new(self.config.video.params.clone())
+            .map_err(|e| CompositionError::SequencingFailed {
+                reason: format!("Failed to initialize video processor: {}", e)
+            })?;
 
-        let mut processed_segments = 0;
+        // Convert VideoSequence to Vec<VideoClip> for compatibility
+        let clips: Vec<VideoClip> = video_sequence.clips().to_vec();
 
-        for (i, &cut_time) in timeline.cuts.iter().enumerate() {
-            let clip_id = timeline.clip_assignments.get(i).copied().unwrap_or(1);
-
-            if let Some(clip) = video_sequence.get_clip(clip_id) {
-                debug!("Processing segment {} at {:.2}s with clip: {}",
-                       i, cut_time, clip.name);
-
-                // Create a sample frame (in real implementation, load from video)
-                let mut frame = self.create_sample_frame_for_clip(clip);
-
-                // Apply the retro style effect
-                self.style.apply_effect(&mut frame, &self.config.style)?;
-
-                // In real implementation: save processed frame to temporary storage
-                processed_segments += 1;
-
-                // Simulate processing time
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            } else {
-                warn!("Could not find clip {} for timeline segment {}", clip_id, i);
-            }
-        }
+        // Process the timeline
+        let processed_segments = processor.process_timeline(
+            timeline,
+            &clips,
+            self.style.as_ref(),
+            &self.config.style,
+            audio_analysis.duration,
+        ).await.map_err(|e| CompositionError::SequencingFailed {
+            reason: format!("Video processing failed: {}", e)
+        })?;
 
         info!("   ✅ Video processing complete:");
-        info!("      Segments processed: {}", processed_segments);
+        info!("      Segments processed: {}", processed_segments.len());
+        info!("      Total frames: {}", 
+              processed_segments.iter().map(|s| s.frames.len()).sum::<usize>());
         info!("      Style applied: {}", self.style.name());
 
-        Ok(())
-    }
-
-    /// Create a sample frame for demonstration (placeholder for real video loading)
-    fn create_sample_frame_for_clip(&self, clip: &VideoClip) -> Frame {
-        // Create different colored frames based on clip sequence for demo
-        let color = match clip.sequence_number % 4 {
-            0 => [120, 80, 160],   // Purple
-            1 => [160, 120, 80],   // Orange
-            2 => [80, 160, 120],   // Green
-            _ => [140, 140, 140],  // Gray
-        };
-
-        Frame::new_filled(640, 480, color)
+        Ok(processed_segments)
     }
 
     // ==========================================
@@ -441,37 +394,34 @@ impl CompositionEngine {
     /// Generate the final output video file
     async fn generate_final_output(
         &self,
-        timeline: &CompositionTimeline,
+        processed_segments: &[crate::video::ProcessedSegment],
+        audio_path: &Path,
         output_path: &Path,
     ) -> Result<()> {
         info!("🎬 Step 5: Generating final output...");
 
-        // For now, create a placeholder output file
-        // In real implementation: encode video with processed frames and original audio
+        // Initialize video compositor
+        let mut compositor = VideoCompositor::new(self.config.video.params.clone());
 
-        debug!("Encoding {} segments to video...", timeline.cuts.len());
-
-        // Simulate encoding time
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        // Create placeholder output
-        let placeholder_content = format!(
-            "Retro-Compositor Output\n\
-             Style: {}\n\
-             Segments: {}\n\
-             Cuts: {:?}\n\
-             Generated: {}",
-            self.style.name(),
-            timeline.cuts.len(),
-            timeline.cuts,
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-        );
-
-        std::fs::write(output_path, placeholder_content)?;
+        // Compose the final video
+        let encoded_video = compositor.compose_video(
+            processed_segments,
+            audio_path,
+            output_path,
+        ).await.map_err(|e| CompositionError::OutputFailed {
+            reason: format!("Video composition failed: {}", e)
+        })?;
 
         info!("   ✅ Output generation complete:");
         info!("      File saved: {:?}", output_path);
-        info!("      Timeline segments: {}", timeline.cuts.len());
+        info!("      Duration: {:.1}s", encoded_video.duration);
+        info!("      Frame count: {}", encoded_video.frame_count);
+        info!("      File size: {:.1} MB", encoded_video.file_size as f64 / 1024.0 / 1024.0);
+
+        // Clean up temporary files
+        compositor.cleanup().map_err(|e| CompositionError::OutputFailed {
+            reason: format!("Cleanup failed: {}", e)
+        })?;
 
         Ok(())
     }

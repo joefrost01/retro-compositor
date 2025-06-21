@@ -74,5 +74,5 @@ pub use crate::{
     composition::CompositionEngine,
     config::Config,
     error::{CompositorError, Result},
-    styles::{Style, StyleRegistry},
+    styles::{Style, StyleRegistry}, // Export Style trait
 };

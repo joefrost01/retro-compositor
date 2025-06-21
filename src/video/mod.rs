@@ -1,17 +1,15 @@
 //! # Video Processing Module
 //!
 //! Handles video file loading, frame processing, and output generation.
-//! This module provides a simple interface for working with video data
-//! while abstracting away the complexity of different video formats.
 
 pub mod types;
-// TODO: Implement these modules
-// pub mod loader;
-// pub mod processor;
-// pub mod compositor;
+pub mod processor;
 
-// Re-exports for convenience
+// Use pure Rust implementation (no FFmpeg linking issues)
+mod loader_pure_rust;
+mod compositor_pure_rust;
+
 pub use types::{Frame, VideoClip, VideoParams, VideoSequence};
-// pub use loader::VideoLoader;
-// pub use processor::VideoProcessor;
-// pub use compositor::VideoCompositor;
+pub use processor::{VideoProcessor, ProcessedSegment};
+pub use loader_pure_rust::{VideoLoader, VideoMetadata};
+pub use compositor_pure_rust::{VideoCompositor, EncodedVideo};
