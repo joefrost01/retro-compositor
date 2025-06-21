@@ -48,8 +48,28 @@ impl VideoCompositor {
             return Ok(temp_dir.clone());
         }
 
-        let temp_dir = format!("./temp_retro_compositor_{}", std::process::id());
+        // Use current directory + unique temp folder
+        let current_dir = std::env::current_dir()
+            .map_err(|e| VideoError::EncodingFailed {
+                reason: format!("Cannot get current directory: {}", e),
+            })?;
+
+        let temp_dir = current_dir
+            .join(format!("retro_temp_{}", std::process::id()))
+            .display()
+            .to_string();
+
         create_dir_all(&temp_dir)?;
+
+        debug!("Created temporary directory: {}", temp_dir);
+
+        // Verify directory exists and is writable
+        let test_file = format!("{}/test.txt", temp_dir);
+        std::fs::write(&test_file, "test").map_err(|e| VideoError::EncodingFailed {
+            reason: format!("Temporary directory not writable: {}", e),
+        })?;
+        std::fs::remove_file(&test_file).ok();
+
         self.temp_dir = Some(temp_dir.clone());
         Ok(temp_dir)
     }
@@ -131,23 +151,33 @@ impl VideoCompositor {
 
         let frame_duration = 1.0 / self.params.fps;
 
-        for frame_path in frame_paths {
-            // Use absolute path to avoid path resolution issues
+        debug!("Creating frame list at: {}", list_path);
+        debug!("Frame duration: {:.6}s", frame_duration);
+
+        for (i, frame_path) in frame_paths.iter().enumerate() {
+            // Convert to absolute path to avoid FFmpeg path resolution issues
             let absolute_path = std::path::Path::new(frame_path)
                 .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(frame_path));
+                .map_err(|e| VideoError::EncodingFailed {
+                    reason: format!("Cannot resolve frame path {}: {}", frame_path, e),
+                })?;
 
+            debug!("Frame {}: {}", i, absolute_path.display());
             writeln!(file, "file '{}'", absolute_path.display())?;
             writeln!(file, "duration {:.6}", frame_duration)?;
         }
 
+        // Add the last frame again for proper duration
         if let Some(last_frame) = frame_paths.last() {
             let absolute_path = std::path::Path::new(last_frame)
                 .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(last_frame));
+                .map_err(|e| VideoError::EncodingFailed {
+                    reason: format!("Cannot resolve last frame path {}: {}", last_frame, e),
+                })?;
             writeln!(file, "file '{}'", absolute_path.display())?;
         }
 
+        debug!("Frame list created with {} entries", frame_paths.len());
         Ok(list_path)
     }
 
