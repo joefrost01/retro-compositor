@@ -292,7 +292,7 @@ impl CompositionEngine {
         beat: &crate::audio::types::Beat,
         audio_analysis: &AudioAnalysis,
     ) -> u32 {
-        // For now, use simple cycling with some intelligence
+        // Simple cycling through available clip indices (1 to num_clips)
         let mut next_clip = (current_clip % num_clips) + 1;
 
         // Consider energy levels for clip selection
@@ -367,9 +367,13 @@ impl CompositionEngine {
         // Convert VideoSequence to Vec<VideoClip> for compatibility
         let clips: Vec<VideoClip> = video_sequence.clips().to_vec();
 
+        // Map timeline clip IDs to actual available clips
+        let mut mapped_timeline = timeline.clone();
+        self.map_timeline_to_available_clips(&mut mapped_timeline, &clips);
+
         // Process the timeline
         let processed_segments = processor.process_timeline(
-            timeline,
+            &mapped_timeline,
             &clips,
             self.style.as_ref(),
             &self.config.style,
@@ -385,6 +389,35 @@ impl CompositionEngine {
         info!("      Style applied: {}", self.style.name());
 
         Ok(processed_segments)
+    }
+
+    /// Map timeline clip IDs to actual available clip sequence numbers
+    fn map_timeline_to_available_clips(
+        &self,
+        timeline: &mut CompositionTimeline,
+        clips: &[VideoClip],
+    ) {
+        if clips.is_empty() {
+            return;
+        }
+
+        // Get sorted list of available sequence numbers
+        let mut available_sequences: Vec<u32> = clips.iter()
+            .map(|c| c.sequence_number)
+            .collect();
+        available_sequences.sort();
+
+        debug!("Available clip sequences: {:?}", available_sequences);
+        debug!("Original timeline assignments: {:?}", timeline.clip_assignments);
+
+        // Map each timeline assignment to an available clip
+        for assignment in timeline.clip_assignments.iter_mut() {
+            // Convert 1-based timeline index to 0-based array index
+            let clip_index = ((*assignment - 1) % available_sequences.len() as u32) as usize;
+            *assignment = available_sequences[clip_index];
+        }
+
+        debug!("Mapped timeline assignments: {:?}", timeline.clip_assignments);
     }
 
     // ==========================================

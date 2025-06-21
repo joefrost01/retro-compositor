@@ -30,7 +30,7 @@ pub struct ProcessedSegment {
     /// Start time in the original timeline
     pub start_time: f64,
 
-    /// End time in the original timeline  
+    /// End time in the original timeline
     pub end_time: f64,
 
     /// Which clip this segment comes from
@@ -62,7 +62,7 @@ impl VideoProcessor {
         style_config: &StyleConfig,
         total_duration: f64,
     ) -> Result<Vec<ProcessedSegment>> {
-        info!("Processing {} timeline segments with {} style", 
+        info!("Processing {} timeline segments with {} style",
               timeline.cuts.len(), style.name());
 
         let mut processed_segments = Vec::new();
@@ -160,7 +160,7 @@ impl VideoProcessor {
 
         // Load metadata to understand the clip
         let metadata = self.loader.load_metadata(&clip.path)?;
-        debug!("Clip metadata: {:.1}s, {:.1} fps, {}x{}", 
+        debug!("Clip metadata: {:.1}s, {:.1} fps, {}x{}",
                metadata.duration, metadata.fps, metadata.width, metadata.height);
 
         // Determine timestamps to extract

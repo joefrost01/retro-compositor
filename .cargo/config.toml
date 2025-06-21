@@ -1,0 +1,42 @@
+# .cargo/config.toml
+# Advanced performance configuration for Retro-Compositor
+
+[build]
+# Use all available CPU cores for compilation
+#jobs = 0  # 0 = use all cores
+
+# Target-specific optimizations
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",      # Use CPU-specific optimizations
+    "-C", "target-feature=+crt-static", # Static linking for better performance
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",      # Use CPU-specific optimizations (M1/Intel)
+    "-C", "link-arg=-Wl,-dead_strip", # Remove unused code
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",      # Apple Silicon optimizations
+    "-C", "link-arg=-Wl,-dead_strip",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-cpu=native",      # Windows x64 optimizations
+]
+
+# Environment variables for performance
+[env]
+# Use faster allocator on supported platforms
+RUST_MIN_STACK = "8388608"  # 8MB stack size for deep recursion in FFT
+# Enable parallel compilation
+RUST_TEST_THREADS = "0"     # Use all cores for testing
+
+# Linker optimizations (uncomment if using mold/lld)
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]  # Use mold linker for faster builds

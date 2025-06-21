@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use image::{ImageBuffer, Rgb, RgbImage, GenericImageView};
 use tracing::{debug, info, warn};
@@ -202,18 +203,45 @@ impl VideoLoader {
     }
 
     pub fn create_video_clip<P: AsRef<Path>>(&mut self, path: P) -> Result<VideoClip> {
-        if let Some(mut clip) = VideoClip::from_path(path.as_ref()) {
-            if Self::is_supported(path.as_ref()) {
-                if let Ok(metadata) = self.load_metadata(path.as_ref()) {
+        let path = path.as_ref();
+
+        // First try to parse as numbered clip (01_name.mp4)
+        if let Some(mut clip) = VideoClip::from_path(path) {
+            if Self::is_supported(path) {
+                if let Ok(metadata) = self.load_metadata(path) {
                     clip.duration = Some(metadata.duration);
                     clip.fps = Some(metadata.fps);
                     clip.resolution = Some((metadata.width, metadata.height));
                 }
             }
+            return Ok(clip);
+        }
+
+        // If numbered parsing fails, create a clip with auto-assigned number
+        if Self::is_supported(path) {
+            let filename = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("video");
+
+            // Use hash of filename to get consistent sequence number
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            filename.hash(&mut hasher);
+            let sequence_number = (hasher.finish() % 1000) as u32 + 1; // 1-1000
+
+            let mut clip = VideoClip::new(path, sequence_number, filename.to_string());
+
+            if let Ok(metadata) = self.load_metadata(path) {
+                clip.duration = Some(metadata.duration);
+                clip.fps = Some(metadata.fps);
+                clip.resolution = Some((metadata.width, metadata.height));
+            }
+
+            debug!("Auto-assigned sequence number {} to file: {}", sequence_number, filename);
             Ok(clip)
         } else {
             Err(VideoError::LoadFailed {
-                path: path.as_ref().display().to_string(),
+                path: path.display().to_string(),
             }.into())
         }
     }
@@ -235,14 +263,37 @@ impl VideoLoader {
             let path = entry?.path();
 
             if path.is_file() && !self.is_hidden_file(&path) && Self::is_supported(&path) {
-                if let Ok(clip) = self.create_video_clip(&path) {
-                    clips.push(clip);
+                match self.create_video_clip(&path) {
+                    Ok(clip) => {
+                        info!("Loaded clip: {} (sequence: {}, duration: {:.1}s)", 
+                              clip.name, clip.sequence_number, clip.duration.unwrap_or(0.0));
+                        clips.push(clip);
+                    }
+                    Err(e) => {
+                        warn!("Could not load clip {:?}: {}", path, e);
+                    }
                 }
             }
         }
 
+        if clips.is_empty() {
+            return Err(VideoError::LoadFailed {
+                path: format!("No supported video files found in {}", directory.display()),
+            }.into());
+        }
+
+        // Sort clips by sequence number
         clips.sort_by_key(|clip| clip.sequence_number);
+
         info!("Loaded {} clips from directory", clips.len());
+        if clips.iter().any(|c| Self::is_image_file(&c.path)) {
+            info!("Image files detected - using static frame extraction");
+        }
+        if clips.iter().any(|c| !Self::is_image_file(&c.path)) {
+            warn!("Video files detected but FFmpeg not available - using placeholder frames");
+            warn!("For full video support, enable the 'ffmpeg' feature and install FFmpeg");
+        }
+
         Ok(clips)
     }
 
