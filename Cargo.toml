@@ -1,0 +1,64 @@
+[package]
+name = "retro-compositor"
+version = "0.1.0"
+edition = "2021"
+description = "Transform your music into retro-styled video compositions with AI-driven beat synchronization"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/retro-compositor"
+keywords = ["audio", "video", "music", "retro", "effects"]
+categories = ["multimedia::audio", "multimedia::video", "command-line-utilities"]
+
+[[bin]]
+name = "retro-compositor"
+path = "src/main.rs"
+
+[[bin]]
+name = "minimal"
+path = "src/bin/minimal.rs"
+
+[[bin]]
+name = "test_audio"
+path = "src/bin/test_audio.rs"
+
+[dependencies]
+# CLI and configuration
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Audio processing
+rodio = "0.17"
+rustfft = "6.2"
+hound = "3.5"
+symphonia = { version = "0.5", features = ["all"] }
+
+# Mathematical operations
+realfft = "3.3"
+
+# Video/Image processing
+image = "0.24"
+gif = "0.12"
+png = "0.17"
+
+# Async and performance
+tokio = { version = "1.0", features = ["full"] }
+rayon = "1.8"
+num_cpus = "1.16"
+
+# Random number generation
+rand = "0.8"
+
+# Logging and debugging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date/time handling
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+
