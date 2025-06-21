@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::error::{VideoError, Result};
 use crate::styles::{Style, StyleConfig};
 use crate::video::types::{Frame, VideoClip, VideoParams};
-use crate::video::loader_pure_rust::{VideoLoader, VideoMetadata};
+use crate::video::loader_optimized::{VideoLoader, VideoMetadata};
 use crate::composition::engine::CompositionTimeline;
 
 /// Processes video frames with retro effects and manages frame extraction
