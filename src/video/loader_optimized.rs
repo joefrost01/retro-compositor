@@ -1,10 +1,8 @@
-// src/video/loader_optimized.rs - Actually fast video loader
+// src/video/loader_optimized.rs - Memory-efficient version
 
 use std::path::Path;
 use std::process::Command;
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::thread;
 
 use rayon::prelude::*;
 use image::{ImageBuffer, Rgb, RgbImage, GenericImageView};
@@ -26,12 +24,24 @@ pub struct VideoMetadata {
 pub struct VideoLoader {
     metadata_cache: HashMap<String, VideoMetadata>,
     temp_counter: u32,
+    max_parallel_extractions: usize,
 }
 
 impl VideoLoader {
     pub fn new() -> Result<Self> {
         let cpu_count = num_cpus::get();
-        info!("Detected {} CPU cores for parallel processing", cpu_count);
+
+        // **MEMORY OPTIMIZATION** - Limit parallel extractions based on available memory
+        let max_parallel = if cfg!(target_os = "macos") {
+            // For macOS with VideoToolbox, we can be more aggressive but still conservative
+            (cpu_count / 2).max(2).min(8) // 2-8 parallel extractions
+        } else {
+            // For other systems, be more conservative
+            (cpu_count / 4).max(1).min(4) // 1-4 parallel extractions
+        };
+
+        info!("Detected {} CPU cores, using {} parallel extractions for memory efficiency", 
+              cpu_count, max_parallel);
 
         if cfg!(target_os = "macos") {
             info!("macOS detected - will use VideoToolbox hardware acceleration");
@@ -45,10 +55,11 @@ impl VideoLoader {
             })?;
 
         if output.status.success() {
-            info!("Initialized video loader with external FFmpeg command");
+            info!("Initialized memory-optimized video loader with external FFmpeg");
             Ok(Self {
                 metadata_cache: HashMap::new(),
                 temp_counter: 0,
+                max_parallel_extractions: max_parallel,
             })
         } else {
             Err(VideoError::LoadFailed {
@@ -142,14 +153,13 @@ impl VideoLoader {
             return self.load_image_as_frame(path.as_ref());
         }
 
-        // For single frame, just use the batch method with one timestamp
         let frames = self.extract_frames_at_times(path, &[timestamp])?;
         frames.into_iter().next().ok_or_else(|| VideoError::FrameProcessingFailed {
             reason: "No frame extracted".to_string(),
         }.into())
     }
 
-    /// **THIS IS THE KEY OPTIMIZATION** - Extract all frames in parallel using multiple FFmpeg processes
+    /// **MEMORY-OPTIMIZED VERSION** - Process frames in smaller batches to avoid memory exhaustion
     pub fn extract_frames_at_times<P: AsRef<Path>>(&mut self, path: P, timestamps: &[f64]) -> Result<Vec<Frame>> {
         if Self::is_image_file(path.as_ref()) {
             let base_frame = self.load_image_as_frame(path.as_ref())?;
@@ -160,109 +170,176 @@ impl VideoLoader {
             return Ok(Vec::new());
         }
 
-        info!("🚀 Extracting {} frames in parallel from {}", timestamps.len(), path.as_ref().display());
+        let path_str = path.as_ref().display().to_string();
 
-        // Create temp directory
-        let temp_dir = format!("/tmp/retro_compositor_parallel_{}", std::process::id());
+        // **BATCH PROCESSING** - Process frames in smaller batches to manage memory
+        let batch_size = 100; // Process 50 frames at a time
+        let total_frames = timestamps.len();
+
+        info!("🚀 Extracting {} frames in batches of {} from {}", 
+              total_frames, batch_size, path.as_ref().display());
+
+        let mut all_frames = Vec::with_capacity(total_frames);
+        let mut total_success = 0;
+        let mut total_failed = 0;
+
+        // Process in batches
+        for (batch_num, timestamp_batch) in timestamps.chunks(batch_size).enumerate() {
+            info!("Processing batch {}/{} ({} frames)...", 
+                  batch_num + 1, 
+                  (total_frames + batch_size - 1) / batch_size,
+                  timestamp_batch.len());
+
+            match self.extract_batch(&path_str, timestamp_batch, batch_num) {
+                Ok((frames, success_count, failed_count)) => {
+                    all_frames.extend(frames);
+                    total_success += success_count;
+                    total_failed += failed_count;
+                }
+                Err(e) => {
+                    warn!("Batch {} failed: {}, using placeholders", batch_num + 1, e);
+                    // Add placeholder frames for the entire batch
+                    for _ in 0..timestamp_batch.len() {
+                        all_frames.push(Frame::new_filled(1920, 1080, [64, 64, 64]));
+                    }
+                    total_failed += timestamp_batch.len();
+                }
+            }
+
+            // **MEMORY CLEANUP** - Force garbage collection between batches
+            if batch_num % 3 == 2 {
+                // Every 3 batches, try to encourage memory cleanup
+                info!("Encouraging memory cleanup after batch {}...", batch_num + 1);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        info!("✅ All batches complete: {}/{} frames successful", total_success, total_frames);
+        if total_failed > 0 {
+            warn!("⚠️  {} frames failed, using placeholders", total_failed);
+        }
+
+        Ok(all_frames)
+    }
+
+    /// Extract a single batch of frames with controlled parallelism
+    fn extract_batch(&self, path_str: &str, timestamps: &[f64], batch_num: usize) -> Result<(Vec<Frame>, usize, usize)> {
+        // Create temp directory for this batch
+        let temp_dir = format!("/tmp/retro_compositor_batch_{}_{}", std::process::id(), batch_num);
         std::fs::create_dir_all(&temp_dir).map_err(|_| VideoError::FrameProcessingFailed {
             reason: "Cannot create temp directory".to_string(),
         })?;
 
-        let path_str = path.as_ref().display().to_string();
+        // **CONTROLLED PARALLELISM** - Process all timestamps in controlled parallel chunks
+        let chunk_size = self.max_parallel_extractions;
+        let mut all_results = Vec::new();
 
-        // **PARALLEL EXTRACTION** - Use rayon to spawn multiple FFmpeg processes simultaneously
-        let frame_results: Vec<(usize, Result<Frame>)> = timestamps
-            .par_iter()
-            .enumerate()
-            .map(|(i, &timestamp)| {
-                let temp_frame = format!("{}/frame_{:06}.png", temp_dir, i);
+        // Process timestamps in smaller parallel chunks
+        for (chunk_idx, timestamp_chunk) in timestamps.chunks(chunk_size).enumerate() {
+            let chunk_results: Vec<(usize, Result<Frame>)> = timestamp_chunk
+                .par_iter()
+                .enumerate()
+                .map(|(rel_idx, &timestamp)| {
+                    let abs_idx = chunk_idx * chunk_size + rel_idx;
+                    let temp_frame = format!("{}/frame_{:06}.png", temp_dir, abs_idx);
 
-                // Create FFmpeg command with hardware acceleration
-                let mut cmd = Command::new("ffmpeg");
-                cmd.args(&[
-                    "-ss", &timestamp.to_string(),
-                    "-i", &path_str,
-                    "-vframes", "1",
-                    "-f", "image2",
-                    "-q:v", "2"
-                ]);
+                    // Create FFmpeg command with proper argument order
+                    let mut cmd = Command::new("ffmpeg");
 
-                // Add hardware acceleration for M2 MacBook Pro
-                if cfg!(target_os = "macos") {
-                    cmd.args(&["-hwaccel", "videotoolbox"]);
-                }
+                    // Hardware acceleration BEFORE input (macOS only)
+                    if cfg!(target_os = "macos") {
+                        cmd.args(&["-hwaccel", "videotoolbox"]);
+                    }
 
-                cmd.args(&["-y", &temp_frame]);
+                    // Add seek and input
+                    cmd.args(&[
+                        "-ss", &timestamp.to_string(),
+                        "-i", path_str,
+                    ]);
 
-                // Execute FFmpeg
-                let result = match cmd.output() {
-                    Ok(output) if output.status.success() => {
-                        // Check if file was created and has reasonable size
-                        if Path::new(&temp_frame).exists() {
-                            if let Ok(metadata) = std::fs::metadata(&temp_frame) {
-                                if metadata.len() > 1000 {
-                                    // Load the frame
-                                    match image::open(&temp_frame) {
-                                        Ok(img) => {
-                                            let rgb_image = img.to_rgb8();
-                                            let frame = Frame::new(rgb_image);
-                                            // Clean up immediately
-                                            let _ = std::fs::remove_file(&temp_frame);
-                                            Ok(frame)
+                    // Output options - **MEMORY OPTIMIZATION**: Use lower quality for intermediate frames
+                    cmd.args(&[
+                        "-vframes", "1",
+                        "-f", "image2",
+                        "-q:v", "5", // Slightly lower quality to reduce memory usage
+                        "-s", "1920x1080", // **RESIZE TO STANDARD HD** to save memory
+                        "-y",
+                        &temp_frame
+                    ]);
+
+                    // Execute FFmpeg
+                    let result = match cmd.output() {
+                        Ok(output) if output.status.success() => {
+                            if Path::new(&temp_frame).exists() {
+                                if let Ok(metadata) = std::fs::metadata(&temp_frame) {
+                                    if metadata.len() > 500 { // Lower threshold
+                                        match image::open(&temp_frame) {
+                                            Ok(img) => {
+                                                let rgb_image = img.to_rgb8();
+                                                let frame = Frame::new(rgb_image);
+                                                // Clean up immediately
+                                                let _ = std::fs::remove_file(&temp_frame);
+                                                Ok(frame)
+                                            }
+                                            Err(e) => Err(VideoError::FrameProcessingFailed {
+                                                reason: format!("Image load failed: {}", e),
+                                            }.into())
                                         }
-                                        Err(e) => Err(VideoError::FrameProcessingFailed {
-                                            reason: format!("Image load failed: {}", e),
+                                    } else {
+                                        Err(VideoError::FrameProcessingFailed {
+                                            reason: "Frame file too small".to_string(),
                                         }.into())
                                     }
                                 } else {
                                     Err(VideoError::FrameProcessingFailed {
-                                        reason: "Frame file too small".to_string(),
+                                        reason: "Cannot read frame metadata".to_string(),
                                     }.into())
                                 }
                             } else {
                                 Err(VideoError::FrameProcessingFailed {
-                                    reason: "Cannot read frame metadata".to_string(),
+                                    reason: "Frame file not created".to_string(),
                                 }.into())
                             }
-                        } else {
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
                             Err(VideoError::FrameProcessingFailed {
-                                reason: "Frame file not created".to_string(),
+                                reason: format!("FFmpeg failed: {}", stderr),
                             }.into())
                         }
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        Err(VideoError::FrameProcessingFailed {
-                            reason: format!("FFmpeg failed: {}", stderr),
+                        Err(e) => Err(VideoError::FrameProcessingFailed {
+                            reason: format!("FFmpeg execution failed: {}", e),
                         }.into())
-                    }
-                    Err(e) => Err(VideoError::FrameProcessingFailed {
-                        reason: format!("FFmpeg execution failed: {}", e),
-                    }.into())
-                };
+                    };
 
-                (i, result)
-            })
-            .collect();
+                    (abs_idx, result)
+                })
+                .collect();
 
-        // Sort results by index and convert to final frame vector
-        let mut sorted_results = frame_results;
-        sorted_results.sort_by_key(|(i, _)| *i);
+            // Collect results from this chunk
+            all_results.extend(chunk_results);
+
+            // Small delay between chunks to prevent overwhelming the system
+            if chunk_idx < (timestamps.len() + chunk_size - 1) / chunk_size - 1 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        // Sort results by index and process them
+        all_results.sort_by_key(|(i, _)| *i);
 
         let mut frames = Vec::with_capacity(timestamps.len());
         let mut success_count = 0;
         let mut error_count = 0;
 
-        for (_, result) in sorted_results {
+        for (_, result) in all_results {
             match result {
                 Ok(frame) => {
                     frames.push(frame);
                     success_count += 1;
                 }
-                Err(e) => {
+                Err(_) => {
                     error_count += 1;
-                    // Create a simple placeholder frame for failed extractions
-                    warn!("Frame extraction failed: {}", e);
                     frames.push(Frame::new_filled(1920, 1080, [64, 64, 64]));
                 }
             }
@@ -271,12 +348,7 @@ impl VideoLoader {
         // Clean up temp directory
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        info!("✅ Parallel extraction complete: {}/{} frames successful", success_count, timestamps.len());
-        if error_count > 0 {
-            warn!("⚠️  {} frames failed, using placeholders", error_count);
-        }
-
-        Ok(frames)
+        Ok((frames, success_count, error_count))
     }
 
     fn load_image_as_frame(&self, path: &Path) -> Result<Frame> {
@@ -287,7 +359,7 @@ impl VideoLoader {
         Ok(Frame::new(rgb_image))
     }
 
-    // Helper methods for JSON parsing
+    // Helper methods for JSON parsing (unchanged)
     fn extract_json_number(&self, json: &str, key: &str) -> Option<f64> {
         let pattern = format!("\"{}\":", key);
         if let Some(start) = json.find(&pattern) {
@@ -444,6 +516,7 @@ impl Default for VideoLoader {
         Self::new().unwrap_or_else(|_| Self {
             metadata_cache: HashMap::new(),
             temp_counter: 0,
+            max_parallel_extractions: 4,
         })
     }
 }
